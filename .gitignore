@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+
+# 処理対象および出力先の画像
+# 認証情報が写り込んだ画像を誤ってコミットしないよう、既定のフォルダ名を除外している
+images/
+masked/
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# ただしドキュメント用の図は対象に含める
+!docs/*.png
