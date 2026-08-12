@@ -18,10 +18,19 @@ Each image goes through four steps.
 |---|---|---|
 | 1 Screening | Decides only whether credentials are present | Skips irrelevant images early to keep cost down |
 | 2 Detection | Gets a bounding box for each credential | Returned in the normalized `[0, 1000]` space |
-| 3 Redaction | Paints over the text with Pillow | Converts coordinates to pixels and adds padding |
-| 4 Verification | Re-checks the redacted image | Moves anything suspicious to `_review/` |
+| 3 Digit scan | Transcribes the text and finds 12-digit runs with a regex | Keeps the judgement out of the model |
+| 4 Redaction | Paints over the text with Pillow | Converts coordinates to pixels and adds padding |
+| 5 Verification | Re-checks the redacted image | Moves anything suspicious to `_review/` |
 
 Detection results vary between runs. A single detection pass is not guaranteed to catch everything, which is what step 4 is for.
+
+### How 12-digit numbers are handled
+
+A 12-digit number embedded in a longer identifier tends to slip past detection. Asked to find it, the model treats `arn:aws:iam::123456789012:user/foo` as a single identifier and never looks at the digits inside.
+
+So the judgement does not sit with the model. The image is transcribed, and **a regex decides what counts as 12 digits**. Matching lines are redacted whole rather than trimmed to the value — a wider box, but a reliable one.
+
+Pass `--no-digit-scan` to skip this pass and save one call.
 
 ### Keeping processing inside Japan
 
@@ -111,8 +120,9 @@ Redacted images are written to `masked/`. Anything the verification step flagged
 | `--output` | required | Output folder |
 | `--style` | `black` | How to hide values (`black` = solid box, `blur` = Gaussian blur) |
 | `--max-tokens` | `4000` | Response token limit for detection and verification |
-| `--padding-x` | `1.5` | Horizontal padding, as a multiple of the detected box height |
-| `--padding-y` | `0.3` | Vertical padding, same unit |
+| `--no-digit-scan` | - | Skip the 12-digit scan |
+| `--padding-x` | `2.0` | Horizontal padding, as a multiple of the detected box height |
+| `--padding-y` | `0.6` | Vertical padding, same unit |
 | `--region` | `ap-northeast-1` | Region |
 | `--model-id` | `jp.amazon.nova-2-lite-v1:0` | Model ID (inference profile) |
 | `--no-screen` | - | Skip screening and run detection on every image |
@@ -163,7 +173,7 @@ A failure on one image does not stop the rest of the folder — the image lands 
 
 Nothing runs continuously on AWS, so there is no idle cost. The only charge is Bedrock usage.
 
-Each image costs three calls (screening / detection / verification). The run above came to $0.0036 for two images, measured on the author's machine — images with more findings produce more output tokens, so run a few first to get a feel for your own per-image cost.
+Each image costs four calls (screening / detection / digit scan / verification). The run above came to $0.0036 for two images, measured on the author's machine — images with more findings produce more output tokens, so run a few first to get a feel for your own per-image cost.
 
 Nova 2 Lite in the Tokyo region is priced at $0.396 per 1M input tokens and $3.311 per 1M output tokens (values retrieved with `aws pricing get-products --service-code AmazonBedrock`).
 
