@@ -3,8 +3,10 @@
 処理フロー（画像 1 枚あたり）:
   1. スクリーニング  認証情報があるかだけを判定。無ければコピーのみで終了（コスト削減）
   2. 検出            認証情報のバウンディングボックスを [0,1000] 正規化座標で取得
-  3. マスク          Pillow で塗り潰し（座標を実寸へ変換し、パディングを付与）
-  4. 再検証          マスク済み画像を再度 Nova に渡し、残存があれば _review/ へ振り分け
+  3. 12 桁スキャン   テキストを書き起こし、正規表現で 12 桁の数字を含む行を拾う
+                     （判定をモデルに委ねないため確実。該当行はまるごとマスクする）
+  4. マスク          Pillow で塗り潰し（座標を実寸へ変換し、パディングを付与）
+  5. 再検証          マスク済み画像を再度 Nova に渡し、残存があれば _review/ へ振り分け
 
 使い方:
   python mask.py --input ./images --output ./masked
@@ -12,6 +14,7 @@
 
 import argparse
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -37,9 +40,10 @@ PRICE_OUT_PER_1M = 3.311
 # 手元の実測（サンプル 2 枚 / 12 箇所）での不足量は以下だった。
 #   横方向: 最大 1.24 x 高さ（左端が 1〜2 文字分はみ出すケースがある）
 #   縦方向: 最大 0.01 x 高さ（ほぼ常に覆えている）
-# これに余裕を加えた値を既定とする。
-DEFAULT_PAD_X = 1.5
-DEFAULT_PAD_Y = 0.3
+# 隠し残しを避けることを優先し、これに十分な余裕を加えた値を既定とする。
+# 周囲の文字も一緒に消えるが、確実さを取っている。
+DEFAULT_PAD_X = 2.0
+DEFAULT_PAD_Y = 0.6
 
 # 塗り潰しの方式。既定は black（該当領域を単色で置き換えるため確実）。
 # blur はガウスぼかし。見た目を優先したい場合の選択肢であり、
@@ -54,11 +58,10 @@ DEFAULT_MAX_TOKENS = 4000
 
 EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
-CATEGORIES = """- aws_account_id: a 12-digit AWS account number. It may stand alone, or appear
-  inside an ARN such as arn:aws:iam::123456789012:user/foo. When it appears inside
-  an ARN, the box must cover ONLY the 12 consecutive digits - not the whole ARN.
-  The surrounding parts of the ARN must remain readable, and "text" must be the
-  12 digits alone.
+CATEGORIES = """- aws_account_id: a run of exactly 12 consecutive digits. It may stand alone, or
+  sit inside a longer identifier such as arn:aws:iam::123456789012:user/foo -
+  report those as well. Cover ONLY the 12 digits: the characters before and after
+  them must stay readable. "text" must be the 12 digits alone.
 - aws_access_key_id: an access key ID such as AKIA...
 - aws_secret_access_key: a long secret key string
 - api_token: an API key, bearer token, or session token
@@ -91,6 +94,41 @@ Rules:
 Respond with JSON only, no markdown fence, in this exact shape:
 {{"findings": [{{"category": "...", "text": "...", "bbox": [x1, y1, x2, y2]}}]}}
 If there is nothing to report, return {{"findings": []}}."""
+
+# 12 桁の数字を確実に拾うための OCR パス。
+# 「12 桁かどうか」の判定はモデルに任せず、書き起こした文字列に対して
+# コード側の正規表現で行う。モデルは長い識別子を 1 つの塊として扱い、
+# その中の数字の並びを取り出せないことがあるため。
+OCR_PROMPT = """Transcribe the text in this screenshot, line by line.
+
+Rules:
+- Copy each line exactly as it appears, including punctuation and long identifiers.
+- Do not summarise, translate, or omit anything.
+- Give each line a bounding box in the normalized [0, 1000] coordinate space,
+  as [x1, y1, x2, y2] where (x1, y1) is the top-left corner.
+
+Respond with JSON only, no markdown fence. Every element must be an object that
+has BOTH "text" and "bbox" - never a bare string:
+{"lines": [
+  {"text": "first line as it appears", "bbox": [100, 200, 400, 230]},
+  {"text": "second line as it appears", "bbox": [100, 240, 350, 270]}
+]}"""
+
+# 書き起こしが座標なしで返ってきたときに、位置だけを聞き直すためのプロンプト。
+LOCATE_PROMPT = """Find where each of the following strings appears in this
+screenshot, and give its bounding box.
+
+Strings to locate:
+{targets}
+
+Rules:
+- Treat each string as an exact target. Locate the whole string.
+- Give the bounding box in the normalized [0, 1000] coordinate space,
+  as [x1, y1, x2, y2] where (x1, y1) is the top-left corner.
+- If a string appears more than once, report each occurrence.
+
+Respond with JSON only, no markdown fence. Every element must be an object:
+{{"found": [{{"text": "...", "bbox": [x1, y1, x2, y2]}}]}}"""
 
 VERIFY_PROMPT = f"""This screenshot has already been redacted: sensitive values were
 hidden behind solid black boxes or blurred areas. Find any value the redaction MISSED.
@@ -222,8 +260,10 @@ def drop_hallucinations(remaining, boxes, size):
     w, h = size
     real = []
     for r in remaining:
+        if not isinstance(r, dict):
+            continue
         bbox = r.get("bbox")
-        if not bbox:
+        if not valid_bbox(bbox):
             real.append(r)
             continue
         cx = (bbox[0] + bbox[2]) / 2 / 1000 * w
@@ -231,6 +271,82 @@ def drop_hallucinations(remaining, boxes, size):
         if not any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes):
             real.append(r)
     return real
+
+
+DIGIT_RUN = re.compile(r"\d{12}")
+
+
+def valid_bbox(bbox):
+    """座標として使える形か確かめる。モデルの応答は形が崩れることがある。"""
+    return (isinstance(bbox, (list, tuple)) and len(bbox) == 4
+            and all(isinstance(v, (int, float)) for v in bbox))
+
+
+def scan_digit_runs(client, args, img_bytes, fmt, usage):
+    """12 桁以上の数字を含む行を、書き起こしと正規表現で拾う。
+
+    検出プロンプトだけでは、長い識別子（ARN など）に埋め込まれた数字を
+    取りこぼすことがある。ここでは判定をモデルに委ねず、書き起こした
+    テキストに正規表現をかけ、該当した行はまるごとマスク対象にする。
+    値だけを切り出すより範囲は広くなるが、確実に消せる。
+    """
+    data = converse(client, args.model_id, img_bytes, fmt, OCR_PROMPT,
+                    usage, max_tokens=args.max_tokens)
+    lines = items_of(data, "lines")
+
+    # 座標付きで返ってきた場合はそのまま使う
+    hits = []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        text, bbox = line.get("text", ""), line.get("bbox")
+        if valid_bbox(bbox) and DIGIT_RUN.search(str(text)):
+            hits.append({"category": "digits12", "text": text, "bbox": bbox})
+    if hits:
+        return hits
+
+    # 座標なし（文字列だけ）で返ることがある。その場合は該当行の位置を聞き直す。
+    targets = []
+    for line in lines:
+        text = line.get("text", "") if isinstance(line, dict) else line
+        if isinstance(text, str) and DIGIT_RUN.search(text):
+            targets.append(text)
+    if not targets:
+        return []
+    return locate_texts(client, args, img_bytes, fmt, targets, usage)
+
+
+def locate_texts(client, args, img_bytes, fmt, targets, usage):
+    """指定した文字列が画像のどこにあるかを聞き、座標を得る。"""
+    prompt = LOCATE_PROMPT.format(
+        targets="\n".join(f"- {s}" for s in targets))
+    data = converse(client, args.model_id, img_bytes, fmt, prompt,
+                    usage, max_tokens=args.max_tokens)
+    hits = []
+    for item in items_of(data, "found"):
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox")
+        if valid_bbox(bbox):
+            hits.append({"category": "digits12",
+                         "text": item.get("text", ""), "bbox": bbox})
+    return hits
+
+
+def merge_findings(findings, extra):
+    """重なりの大きい枠を捨てて統合する。同じ箇所を二重に塗らないため。"""
+    findings = [f for f in findings
+                if isinstance(f, dict) and valid_bbox(f.get("bbox"))]
+    merged = list(findings)
+    for e in extra:
+        ex1, ey1, ex2, ey2 = e["bbox"]
+        for f in findings:
+            fx1, fy1, fx2, fy2 = f["bbox"]
+            # 既存の枠が新しい枠にすっぽり入るなら、行全体で塗るので不要
+            if fx1 >= ex1 and fy1 >= ey1 and fx2 <= ex2 and fy2 <= ey2:
+                merged = [m for m in merged if m is not f]
+        merged.append(e)
+    return merged
 
 
 def to_review(path, review_dir, reason, findings=0, out_path=None):
@@ -261,7 +377,14 @@ def process(path, out_dir, review_dir, client, args, usage):
         return to_review(path, review_dir, "検出結果を解析できませんでした"
                                            "（--max-tokens の引き上げをお試しください）")
 
-    findings = items_of(detected, "findings")
+    findings = [f for f in items_of(detected, "findings")
+                if isinstance(f, dict) and valid_bbox(f.get("bbox"))]
+
+    if not args.no_digit_scan:
+        # 12 桁の数字は、書き起こし + 正規表現で確実に拾う
+        findings = merge_findings(findings,
+                                  scan_digit_runs(client, args, img_bytes, fmt, usage))
+
     if not findings:
         shutil.copy2(path, out_dir / path.name)
         return "clean", 0, []
@@ -304,6 +427,8 @@ def main():
                    help=f"検出・再検証の応答上限トークン数（既定 {DEFAULT_MAX_TOKENS}）")
     p.add_argument("--style", choices=["black", "blur"], default=DEFAULT_STYLE,
                    help="塗り潰しの方式（既定 black）。認証情報には black を推奨")
+    p.add_argument("--no-digit-scan", action="store_true",
+                   help="12 桁の数字を書き起こしから探すパスを省略する（呼び出しが 1 回減る）")
     p.add_argument("--no-screen", action="store_true",
                    help="スクリーニングを省略して全画像を検出にかける")
     p.add_argument("--no-verify", action="store_true", help="マスク後の再検証を省略する")
@@ -328,7 +453,7 @@ def main():
         except Exception as e:
             # 1 枚の失敗で全体を止めない。処理できなかった画像は要確認へ回す
             status, n, remaining = to_review(
-                path, review_dir, f"処理中にエラーが発生しました（{type(e).__name__}）")
+                path, review_dir, f"処理中にエラーが発生しました（{type(e).__name__}: {e}）")
         tally[status] += 1
         mark = {"clean": "-", "masked": "OK", "review": "!!"}[status]
         print(f"  [{mark}] {path.name}  findings={n}")

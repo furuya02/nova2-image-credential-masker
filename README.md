@@ -138,7 +138,7 @@ Padding is expressed as a multiple of the **detected box height** rather than th
 
 The defaults come from processing two sample images (12 regions) five times each on the author's machine, plus some margin. Shortfall skewed to the left edge: 1.24x the text height on the left, 0.21x on the right, and 0.00x top and bottom. Treat that as one data point; your own images may need different values.
 
-Where characters sit flush against the value, as in an ARN, the default will also cover a few neighbouring characters. Lower `--padding-x` if ARN readability matters more to you, at the cost of a higher chance of missing part of a value.
+Where characters sit flush against the value — a number embedded in a longer string, say — the default will also cover a few neighbouring characters. Lower `--padding-x` if the surrounding text matters more to you, at the cost of a higher chance of missing part of a value.
 
 ### When the response cannot be parsed
 
