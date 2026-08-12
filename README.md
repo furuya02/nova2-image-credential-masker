@@ -149,7 +149,7 @@ Nova 2 Lite in the Tokyo region is priced at $0.396 per 1M input tokens and $3.3
 
 Image input is billed at a flat 230 tokens per image regardless of resolution ([Multimodal understanding](https://docs.aws.amazon.com/nova/latest/nova2-userguide/using-multimodal-models.html)).
 
-The Bedrock price list also contains a `nova-grounding` item at $0.03 per request, but that covers [Web Grounding](https://docs.aws.amazon.com/nova/latest/nova2-userguide/web-grounding.html) — the feature that lets Nova search the web and answer with citations. It has to be requested explicitly as a systemTool in `toolConfig`, which this tool never does, so it is not charged here.
+The Bedrock price list also contains a `nova-grounding` item at $0.03 per request, but that covers [Web Grounding](https://docs.aws.amazon.com/nova/latest/nova2-userguide/web-grounding.html) — the feature that lets Nova search the web and answer with citations. It has to be requested explicitly as a systemTool in `toolConfig`, which this tool never does, so it is not charged here — checking Cost Explorer the day after a run showed input and output token charges only.
 
 ## Caveats
 

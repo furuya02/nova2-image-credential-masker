@@ -149,7 +149,7 @@ AWS 上に常駐するリソースは作成しないため、放置によるコ�
 
 画像の入力トークンは、解像度によらず 1 枚あたり 230 トークンの固定で課金されます（[Multimodal understanding](https://docs.aws.amazon.com/nova/latest/nova2-userguide/using-multimodal-models.html)）。
 
-Bedrock の料金表には `nova-grounding` という 1 リクエストあたり $0.03 の項目がありますが、これは [Web Grounding](https://docs.aws.amazon.com/nova/latest/nova2-userguide/web-grounding.html)（Nova が Web を検索して出典付きで回答する機能）に対する課金です。利用するには `toolConfig` で systemTool として明示的に指定する必要があり、本ツールは使用していないため課金されません。
+Bedrock の料金表には `nova-grounding` という 1 リクエストあたり $0.03 の項目がありますが、これは [Web Grounding](https://docs.aws.amazon.com/nova/latest/nova2-userguide/web-grounding.html)（Nova が Web を検索して出典付きで回答する機能）に対する課金です。利用するには `toolConfig` で systemTool として明示的に指定する必要があり、本ツールは使用していないため課金されません。実行した翌日に Cost Explorer で確認しても、計上されていたのは入力・出力のトークン課金だけでした。
 
 ## 注意事項
 
