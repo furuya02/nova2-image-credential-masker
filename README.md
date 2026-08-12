@@ -140,11 +140,11 @@ The defaults come from processing two sample images (12 regions) five times each
 
 Where characters sit flush against the value, as in an ARN, the default will also cover a few neighbouring characters. Lower `--padding-x` if ARN readability matters more to you, at the cost of a higher chance of missing part of a value.
 
-### When the response gets cut off
+### When the response cannot be parsed
 
-Detection and verification return JSON with coordinates, so images carrying a lot of credentials produce long responses. If the limit is reached the JSON ends mid-way and cannot be parsed.
+Nova does not always answer in the exact shape the prompt asks for. With nothing to report it may return just `[]` instead of `{"remaining": []}`, so this tool accepts both an object and a bare array.
 
-When that happens the image is moved to `_review/` and the reason is printed.
+If the response still cannot be parsed — cut off by the token limit, or not JSON at all — the image is moved to `_review/` and the reason is printed.
 
 ```
 [!!] 001.png  findings=0

@@ -147,18 +147,38 @@ def converse(client, model_id, img_bytes, fmt, prompt, usage, max_tokens=DEFAULT
 
 
 def parse_json(text):
+    """応答から JSON を取り出す。解析できなければ None を返す。
+
+    指定した形（オブジェクト）で返らないことがある。とくに該当なしの場合、
+    {"remaining": []} ではなく [] だけを返してくることがあるため、
+    オブジェクトと配列の両方を受け取れるようにしている。
+    """
     t = text.strip()
     if t.startswith("```"):
         t = t.split("```")[1]
         if t.startswith("json"):
             t = t[4:]
-    start, end = t.find("{"), t.rfind("}")
-    if start < 0 or end < start:
-        return None
-    try:
-        return json.loads(t[start:end + 1])
-    except json.JSONDecodeError:
-        return None
+    candidates = []
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start, end = t.find(opener), t.rfind(closer)
+        if 0 <= start < end:
+            candidates.append((start, t[start:end + 1]))
+    # 先に現れる方が外側。[{...}] で中のオブジェクトだけを拾わないようにする
+    for _, chunk in sorted(candidates):
+        try:
+            return json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def items_of(data, key):
+    """{"key": [...]} でも [...] でも、リストとして受け取れるようにする。"""
+    if isinstance(data, dict):
+        return data.get(key) or []
+    if isinstance(data, list):
+        return data
+    return []
 
 
 def image_format(path):
@@ -231,7 +251,7 @@ def process(path, out_dir, review_dir, client, args, usage):
         screened = converse(client, args.model_id, img_bytes, fmt,
                             SCREEN_PROMPT, usage, max_tokens=100)
         # 判定できなかったときは検出へ進める（対象なしと決めつけない）
-        if screened is not None and not screened.get("has_credentials"):
+        if isinstance(screened, dict) and not screened.get("has_credentials"):
             shutil.copy2(path, out_dir / path.name)
             return "clean", 0, []
 
@@ -241,7 +261,7 @@ def process(path, out_dir, review_dir, client, args, usage):
         return to_review(path, review_dir, "検出結果を解析できませんでした"
                                            "（--max-tokens の引き上げをお試しください）")
 
-    findings = detected.get("findings", [])
+    findings = items_of(detected, "findings")
     if not findings:
         shutil.copy2(path, out_dir / path.name)
         return "clean", 0, []
@@ -262,7 +282,7 @@ def process(path, out_dir, review_dir, client, args, usage):
                                            "（--max-tokens の引き上げをお試しください）",
                          len(findings), out_path)
 
-    remaining = drop_hallucinations(verified.get("remaining", []), boxes, img.size)
+    remaining = drop_hallucinations(items_of(verified, "remaining"), boxes, img.size)
     if remaining:
         review_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(out_path), review_dir / path.name)
