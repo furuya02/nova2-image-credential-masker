@@ -3,7 +3,7 @@
 処理フロー（画像 1 枚あたり）:
   1. スクリーニング  認証情報があるかだけを判定。無ければコピーのみで終了（コスト削減）
   2. 検出            認証情報のバウンディングボックスを [0,1000] 正規化座標で取得
-  3. 12 桁スキャン   テキストを書き起こし、正規表現で 12 桁の数字を含む行を拾う
+  3. 12 桁スキャン   テキストを文字起こしして、正規表現で 12 桁の数字を含む行を拾う
                      （判定をモデルに委ねないため確実。該当行はまるごとマスクする）
   4. マスク          Pillow で塗り潰し（座標を実寸へ変換し、パディングを付与）
   5. 再検証          マスク済み画像を再度 Nova に渡し、残存があれば _review/ へ振り分け
@@ -40,10 +40,9 @@ PRICE_OUT_PER_1M = 3.311
 # 手元の実測（サンプル 2 枚 / 12 箇所）での不足量は以下だった。
 #   横方向: 最大 1.24 x 高さ（左端が 1〜2 文字分はみ出すケースがある）
 #   縦方向: 最大 0.01 x 高さ（ほぼ常に覆えている）
-# 隠し残しを避けることを優先し、これに十分な余裕を加えた値を既定とする。
-# 周囲の文字も一緒に消えるが、確実さを取っている。
-DEFAULT_PAD_X = 2.0
-DEFAULT_PAD_Y = 0.6
+# 実測の不足量（左 1.24）を確実に覆いつつ、隠す範囲が必要以上に広がらない値を既定とする。
+DEFAULT_PAD_X = 1.5
+DEFAULT_PAD_Y = 0.4
 
 # 塗り潰しの方式。既定は black（該当領域を単色で置き換えるため確実）。
 # blur はガウスぼかし。見た目を優先したい場合の選択肢であり、
@@ -55,6 +54,10 @@ BLUR_RADIUS_RATIO = 0.5   # ぼかし半径。検出枠の高さに対する比�
 # 認証情報が多く写り込んだ画像ではそれなりの長さになる。
 # 上限に達すると JSON が途中で終わり解析できないので、余裕を持たせている。
 DEFAULT_MAX_TOKENS = 4000
+
+# 文字起こしの実行回数。同じ画像でも拾える行が毎回変わるため、
+# 複数回まわして重ね合わせる。取りこぼしを減らすことを優先した既定値。
+DEFAULT_OCR_PASSES = 3
 
 EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
@@ -96,7 +99,7 @@ Respond with JSON only, no markdown fence, in this exact shape:
 If there is nothing to report, return {{"findings": []}}."""
 
 # 12 桁の数字を確実に拾うための OCR パス。
-# 「12 桁かどうか」の判定はモデルに任せず、書き起こした文字列に対して
+# 「12 桁かどうか」の判定はモデルに任せず、文字起こしした文字列に対して
 # コード側の正規表現で行う。モデルは長い識別子を 1 つの塊として扱い、
 # その中の数字の並びを取り出せないことがあるため。
 OCR_PROMPT = """Transcribe the text in this screenshot, line by line.
@@ -114,7 +117,7 @@ has BOTH "text" and "bbox" - never a bare string:
   {"text": "second line as it appears", "bbox": [100, 240, 350, 270]}
 ]}"""
 
-# 書き起こしが座標なしで返ってきたときに、位置だけを聞き直すためのプロンプト。
+# 文字起こしが座標なしで返ってきたときに、位置だけを聞き直すためのプロンプト。
 LOCATE_PROMPT = """Find where each of the following strings appears in this
 screenshot, and give its bounding box.
 
@@ -273,7 +276,9 @@ def drop_hallucinations(remaining, boxes, size):
     return real
 
 
-DIGIT_RUN = re.compile(r"\d{12}")
+# 12 桁の数字。AWS コンソールでは 1234-5678-9012 のように区切って表示されることが
+# あるため、ハイフンや空白で区切られた形も拾う。
+DIGIT_RUN = re.compile(r"\d{12}|\d{4}[\s-]\d{4}[\s-]\d{4}")
 
 
 def valid_bbox(bbox):
@@ -283,13 +288,35 @@ def valid_bbox(bbox):
 
 
 def scan_digit_runs(client, args, img_bytes, fmt, usage):
-    """12 桁以上の数字を含む行を、書き起こしと正規表現で拾う。
+    """12 桁の数字を含む行を、文字起こしと正規表現で拾う。
 
-    検出プロンプトだけでは、長い識別子（ARN など）に埋め込まれた数字を
-    取りこぼすことがある。ここでは判定をモデルに委ねず、書き起こした
-    テキストに正規表現をかけ、該当した行はまるごとマスク対象にする。
-    値だけを切り出すより範囲は広くなるが、確実に消せる。
+    検出プロンプトだけでは、長い識別子に埋め込まれた数字を取りこぼす。
+    ここでは判定をモデルに委ねず、文字起こししたテキストに正規表現をかけ、
+    該当した行はまるごとマスク対象にする。範囲は広くなるが確実に消せる。
+
+    文字起こし自体は実行のたびに揺らぎ、1 回では拾い切れないことがある。
+    そのため既定で複数回実行し、結果を重ね合わせる（--ocr-passes）。
     """
+    hits = []
+    for _ in range(max(1, args.ocr_passes)):
+        hits += scan_once(client, args, img_bytes, fmt, usage)
+    return dedupe_hits(hits)
+
+
+def dedupe_hits(hits):
+    """同じ箇所を指す結果をまとめる。座標が近いものは同一とみなす。"""
+    kept = []
+    for h in hits:
+        x1, y1, x2, y2 = h["bbox"]
+        if any(abs(x1 - k["bbox"][0]) < 20 and abs(y1 - k["bbox"][1]) < 20
+               and abs(x2 - k["bbox"][2]) < 20 and abs(y2 - k["bbox"][3]) < 20
+               for k in kept):
+            continue
+        kept.append(h)
+    return kept
+
+
+def scan_once(client, args, img_bytes, fmt, usage):
     data = converse(client, args.model_id, img_bytes, fmt, OCR_PROMPT,
                     usage, max_tokens=args.max_tokens)
     lines = items_of(data, "lines")
@@ -356,20 +383,27 @@ def to_review(path, review_dir, reason, findings=0, out_path=None):
         shutil.move(str(out_path), review_dir / path.name)
     else:
         shutil.copy2(path, review_dir / path.name)
-    return "review", findings, [{"category": "-", "text": reason}]
+    return "review", findings, [{"category": "-", "text": reason}], 0
 
 
 def process(path, out_dir, review_dir, client, args, usage):
     img_bytes = path.read_bytes()
     fmt = image_format(path)
 
-    if not args.no_screen:
+    # 12 桁スキャンはスクリーニングより先に、無条件で実行する。
+    # スクリーニングは「認証情報らしさ」で判断するため、識別子やリソース名に
+    # 埋もれた数字しか写っていない画面を「対象なし」と判定してしまう。
+    # 数字の判定は正規表現で完結するので、モデルの判断を待つ必要がない。
+    digit_hits = [] if args.no_digit_scan else scan_digit_runs(
+        client, args, img_bytes, fmt, usage)
+
+    if not args.no_screen and not digit_hits:
         screened = converse(client, args.model_id, img_bytes, fmt,
                             SCREEN_PROMPT, usage, max_tokens=100)
         # 判定できなかったときは検出へ進める（対象なしと決めつけない）
         if isinstance(screened, dict) and not screened.get("has_credentials"):
             shutil.copy2(path, out_dir / path.name)
-            return "clean", 0, []
+            return "clean", 0, [], 0
 
     detected = converse(client, args.model_id, img_bytes, fmt, DETECT_PROMPT,
                         usage, max_tokens=args.max_tokens)
@@ -380,14 +414,12 @@ def process(path, out_dir, review_dir, client, args, usage):
     findings = [f for f in items_of(detected, "findings")
                 if isinstance(f, dict) and valid_bbox(f.get("bbox"))]
 
-    if not args.no_digit_scan:
-        # 12 桁の数字は、書き起こし + 正規表現で確実に拾う
-        findings = merge_findings(findings,
-                                  scan_digit_runs(client, args, img_bytes, fmt, usage))
+    findings = merge_findings(findings, digit_hits)
+    n_digits = len(digit_hits)
 
     if not findings:
         shutil.copy2(path, out_dir / path.name)
-        return "clean", 0, []
+        return "clean", 0, [], n_digits
 
     img = Image.open(path).convert("RGB")
     boxes = apply_mask(img, findings, args.padding_x, args.padding_y, args.style)
@@ -395,7 +427,7 @@ def process(path, out_dir, review_dir, client, args, usage):
     img.save(out_path)
 
     if args.no_verify:
-        return "masked", len(findings), []
+        return "masked", len(findings), [], n_digits
 
     verified = converse(client, args.model_id, out_path.read_bytes(),
                         image_format(out_path), VERIFY_PROMPT, usage,
@@ -409,8 +441,8 @@ def process(path, out_dir, review_dir, client, args, usage):
     if remaining:
         review_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(out_path), review_dir / path.name)
-        return "review", len(findings), remaining
-    return "masked", len(findings), []
+        return "review", len(findings), remaining, n_digits
+    return "masked", len(findings), [], n_digits
 
 
 def main():
@@ -427,8 +459,11 @@ def main():
                    help=f"検出・再検証の応答上限トークン数（既定 {DEFAULT_MAX_TOKENS}）")
     p.add_argument("--style", choices=["black", "blur"], default=DEFAULT_STYLE,
                    help="塗り潰しの方式（既定 black）。認証情報には black を推奨")
+    p.add_argument("--ocr-passes", type=int, default=DEFAULT_OCR_PASSES,
+                   help=f"文字起こしを何回行うか（既定 {DEFAULT_OCR_PASSES}）。"
+                        "多いほど取りこぼしは減るが呼び出しが増える")
     p.add_argument("--no-digit-scan", action="store_true",
-                   help="12 桁の数字を書き起こしから探すパスを省略する（呼び出しが 1 回減る）")
+                   help="12 桁の数字を文字起こしから探すパスを省略する（呼び出しが 1 回減る）")
     p.add_argument("--no-screen", action="store_true",
                    help="スクリーニングを省略して全画像を検出にかける")
     p.add_argument("--no-verify", action="store_true", help="マスク後の再検証を省略する")
@@ -448,15 +483,19 @@ def main():
 
     print(f"model={args.model_id} region={args.region} images={len(images)}\n")
     for path in images:
+        digits = 0
         try:
-            status, n, remaining = process(path, out_dir, review_dir, client, args, usage)
+            status, n, remaining, digits = process(path, out_dir, review_dir,
+                                                   client, args, usage)
         except Exception as e:
             # 1 枚の失敗で全体を止めない。処理できなかった画像は要確認へ回す
-            status, n, remaining = to_review(
+            status, n, remaining, digits = to_review(
                 path, review_dir, f"処理中にエラーが発生しました（{type(e).__name__}: {e}）")
         tally[status] += 1
         mark = {"clean": "-", "masked": "OK", "review": "!!"}[status]
         print(f"  [{mark}] {path.name}  findings={n}")
+        if digits:
+            print(f"        12 桁スキャン: {digits} 件")
         for r in remaining:
             print(f"        残存の疑い: {r.get('category')} {str(r.get('text'))[:40]!r}")
 
