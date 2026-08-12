@@ -110,6 +110,7 @@ Redacted images are written to `masked/`. Anything the verification step flagged
 | `--input` | required | Input folder |
 | `--output` | required | Output folder |
 | `--style` | `black` | How to hide values (`black` = solid box, `blur` = Gaussian blur) |
+| `--max-tokens` | `4000` | Response token limit for detection and verification |
 | `--padding-x` | `1.5` | Horizontal padding, as a multiple of the detected box height |
 | `--padding-y` | `0.3` | Vertical padding, same unit |
 | `--region` | `ap-northeast-1` | Region |
@@ -138,6 +139,25 @@ Padding is expressed as a multiple of the **detected box height** rather than th
 The defaults come from processing two sample images (12 regions) five times each on the author's machine, plus some margin. Shortfall skewed to the left edge: 1.24x the text height on the left, 0.21x on the right, and 0.00x top and bottom. Treat that as one data point; your own images may need different values.
 
 Where characters sit flush against the value, as in an ARN, the default will also cover a few neighbouring characters. Lower `--padding-x` if ARN readability matters more to you, at the cost of a higher chance of missing part of a value.
+
+### When the response gets cut off
+
+Detection and verification return JSON with coordinates, so images carrying a lot of credentials produce long responses. If the limit is reached the JSON ends mid-way and cannot be parsed.
+
+When that happens the image is moved to `_review/` and the reason is printed.
+
+```
+[!!] 001.png  findings=0
+      検出結果を解析できませんでした（--max-tokens の引き上げをお試しください）
+```
+
+Raise the limit and run again.
+
+```bash
+python mask.py --input ./images --output ./masked --max-tokens 8000
+```
+
+A failure on one image does not stop the rest of the folder — the image lands in `_review/` and processing continues.
 
 ## Cost
 

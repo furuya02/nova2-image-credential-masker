@@ -47,6 +47,11 @@ DEFAULT_PAD_Y = 0.3
 DEFAULT_STYLE = "black"
 BLUR_RADIUS_RATIO = 0.5   # ぼかし半径。検出枠の高さに対する比率
 
+# 応答の上限トークン数。検出・再検証は座標付き JSON を返すため、
+# 認証情報が多く写り込んだ画像ではそれなりの長さになる。
+# 上限に達すると JSON が途中で終わり解析できないので、余裕を持たせている。
+DEFAULT_MAX_TOKENS = 4000
+
 EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 CATEGORIES = """- aws_account_id: a 12-digit AWS account number. It may stand alone, or appear
@@ -120,7 +125,8 @@ class Usage:
         return (self.input * PRICE_IN_PER_1M + self.output * PRICE_OUT_PER_1M) / 1_000_000
 
 
-def converse(client, model_id, img_bytes, fmt, prompt, usage, max_tokens=2000):
+def converse(client, model_id, img_bytes, fmt, prompt, usage, max_tokens=DEFAULT_MAX_TOKENS):
+    """Nova を呼び出して JSON を受け取る。解析できなかった場合は None を返す。"""
     resp = client.converse(
         modelId=model_id,
         messages=[{
@@ -133,6 +139,10 @@ def converse(client, model_id, img_bytes, fmt, prompt, usage, max_tokens=2000):
         inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0},
     )
     usage.add(resp["usage"])
+    # 上限に達した応答は JSON が途中で終わっているため使えない。
+    # 検出項目が多い画像で起きやすく、--max-tokens で引き上げられる。
+    if resp.get("stopReason") == "max_tokens":
+        return None
     return parse_json(resp["output"]["message"]["content"][0]["text"])
 
 
@@ -143,7 +153,12 @@ def parse_json(text):
         if t.startswith("json"):
             t = t[4:]
     start, end = t.find("{"), t.rfind("}")
-    return json.loads(t[start:end + 1])
+    if start < 0 or end < start:
+        return None
+    try:
+        return json.loads(t[start:end + 1])
+    except json.JSONDecodeError:
+        return None
 
 
 def image_format(path):
@@ -198,6 +213,16 @@ def drop_hallucinations(remaining, boxes, size):
     return real
 
 
+def to_review(path, review_dir, reason, findings=0, out_path=None):
+    """判断できなかった画像を要確認へ回す。応答を解析できない場合は安全側に倒す。"""
+    review_dir.mkdir(parents=True, exist_ok=True)
+    if out_path and out_path.exists():
+        shutil.move(str(out_path), review_dir / path.name)
+    else:
+        shutil.copy2(path, review_dir / path.name)
+    return "review", findings, [{"category": "-", "text": reason}]
+
+
 def process(path, out_dir, review_dir, client, args, usage):
     img_bytes = path.read_bytes()
     fmt = image_format(path)
@@ -205,11 +230,17 @@ def process(path, out_dir, review_dir, client, args, usage):
     if not args.no_screen:
         screened = converse(client, args.model_id, img_bytes, fmt,
                             SCREEN_PROMPT, usage, max_tokens=100)
-        if not screened.get("has_credentials"):
+        # 判定できなかったときは検出へ進める（対象なしと決めつけない）
+        if screened is not None and not screened.get("has_credentials"):
             shutil.copy2(path, out_dir / path.name)
             return "clean", 0, []
 
-    detected = converse(client, args.model_id, img_bytes, fmt, DETECT_PROMPT, usage)
+    detected = converse(client, args.model_id, img_bytes, fmt, DETECT_PROMPT,
+                        usage, max_tokens=args.max_tokens)
+    if detected is None:
+        return to_review(path, review_dir, "検出結果を解析できませんでした"
+                                           "（--max-tokens の引き上げをお試しください）")
+
     findings = detected.get("findings", [])
     if not findings:
         shutil.copy2(path, out_dir / path.name)
@@ -224,7 +255,13 @@ def process(path, out_dir, review_dir, client, args, usage):
         return "masked", len(findings), []
 
     verified = converse(client, args.model_id, out_path.read_bytes(),
-                        image_format(out_path), VERIFY_PROMPT, usage)
+                        image_format(out_path), VERIFY_PROMPT, usage,
+                        max_tokens=args.max_tokens)
+    if verified is None:
+        return to_review(path, review_dir, "再検証の結果を解析できませんでした"
+                                           "（--max-tokens の引き上げをお試しください）",
+                         len(findings), out_path)
+
     remaining = drop_hallucinations(verified.get("remaining", []), boxes, img.size)
     if remaining:
         review_dir.mkdir(parents=True, exist_ok=True)
@@ -243,6 +280,8 @@ def main():
                    help=f"縦方向のパディング（検出枠の高さに対する倍率, 既定 {DEFAULT_PAD_Y}）")
     p.add_argument("--region", default=DEFAULT_REGION)
     p.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    p.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+                   help=f"検出・再検証の応答上限トークン数（既定 {DEFAULT_MAX_TOKENS}）")
     p.add_argument("--style", choices=["black", "blur"], default=DEFAULT_STYLE,
                    help="塗り潰しの方式（既定 black）。認証情報には black を推奨")
     p.add_argument("--no-screen", action="store_true",
@@ -264,7 +303,12 @@ def main():
 
     print(f"model={args.model_id} region={args.region} images={len(images)}\n")
     for path in images:
-        status, n, remaining = process(path, out_dir, review_dir, client, args, usage)
+        try:
+            status, n, remaining = process(path, out_dir, review_dir, client, args, usage)
+        except Exception as e:
+            # 1 枚の失敗で全体を止めない。処理できなかった画像は要確認へ回す
+            status, n, remaining = to_review(
+                path, review_dir, f"処理中にエラーが発生しました（{type(e).__name__}）")
         tally[status] += 1
         mark = {"clean": "-", "masked": "OK", "review": "!!"}[status]
         print(f"  [{mark}] {path.name}  findings={n}")
